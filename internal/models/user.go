@@ -12,28 +12,33 @@ type User struct {
 	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
 	UpdatedAt   time.Time          `bson:"updated_at" json:"updated_at"`
 	UserName    string             `bson:"user_name" json:"user_name"`
-	FirstName   string             `bson:"first_name" json:"first_name"`
-	LastName    string             `bson:"last_name" json:"last_name"`
-	ProfilePic  string             `bson:"profile_pic" json:"profile_pic"`
 	WalletId    string             `bson:"wallet_id" json:"wallet_id"`
 	KycStatus   string             `bson:"kyc_status" json:"kyc_status"`
 }
 
+type UpdateUserRequest struct {
+	UserName string `json:"user_name" binding:"required"`
+	WalletId string `json:"wallet_id" binding:"required"`
+}
+
 type PublicUser struct {
-	ID    string `json:"id" bson:"id"`
-	Name  string `json:"name" bson:"name"`
-	Email string `json:"email" bson:"email"`
-	// Role      string    `json:"role" bson:"role"`
-	CreatedAt time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
+	ID          string    `json:"id" bson:"id"`
+	UserName    string    `json:"user_name" bson:"user_name"`
+	PhoneNumber string    `json:"phone_number" bson:"phone_number"`
+	WalletId    string    `json:"wallet_id" bson:"wallet_id"`
+	KycStatus   string    `json:"kyc_status" bson:"kyc_status"`
+	CreatedAt   time.Time `json:"created_at" bson:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" bson:"updated_at"`
 }
 
 func (u *User) ToPublic() PublicUser {
 	return PublicUser{
-		ID:   u.ID.Hex(),
-		Name: u.UserName,
-		// Role:      u.Role,
-		CreatedAt: u.CreatedAt,
-		UpdatedAt: u.UpdatedAt,
+		ID:          u.ID.Hex(),
+		UserName:    u.UserName,
+		PhoneNumber: u.PhoneNumber,
+		WalletId:    u.WalletId,
+		KycStatus:   u.KycStatus,
+		CreatedAt:   u.CreatedAt,
+		UpdatedAt:   u.UpdatedAt,
 	}
 }

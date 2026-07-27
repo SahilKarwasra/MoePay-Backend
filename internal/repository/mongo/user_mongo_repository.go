@@ -10,6 +10,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	mongoDriver "go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type UserMongoRepository struct {
@@ -22,6 +23,15 @@ func NewUserMongoRepository(
 	return &UserMongoRepository{
 		collection: collection,
 	}
+}
+
+func (r *UserMongoRepository) EnsureIndexes(ctx context.Context) error {
+	indexModel := mongoDriver.IndexModel{
+		Keys:    bson.D{{Key: "wallet_id", Value: 1}},
+		Options: options.Index().SetUnique(true).SetSparse(true),
+	}
+	_, err := r.collection.Indexes().CreateOne(ctx, indexModel)
+	return err
 }
 
 func (r *UserMongoRepository) CreateUser(
@@ -65,13 +75,33 @@ func (r *UserMongoRepository) GetUserByID(
 ) (*models.User, error) {
 	objectID, err := primitive.ObjectIDFromHex(userID)
 	if err != nil {
-		return nil, err
+		return nil, repository.ErrInvalidUserID
 	}
 
 	var user models.User
 
 	err = r.collection.
 		FindOne(ctx, bson.M{"_id": objectID}).
+		Decode(&user)
+
+	if err != nil {
+		if errors.Is(err, mongoDriver.ErrNoDocuments) {
+			return nil, repository.ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	return &user, nil
+}
+
+func (r *UserMongoRepository) GetUserByWalletID(
+	ctx context.Context,
+	walletID string,
+) (*models.User, error) {
+	var user models.User
+
+	err := r.collection.
+		FindOne(ctx, bson.M{"wallet_id": walletID}).
 		Decode(&user)
 
 	if err != nil {
@@ -94,20 +124,16 @@ func (r *UserMongoRepository) UpdateUser(
 
 	update := bson.M{
 		"$set": bson.M{
-			"user_name":   user.UserName,
-			"first_name":  user.FirstName,
-			"last_name":   user.LastName,
-			"profile_pic": user.ProfilePic,
-			"wallet_id":   user.WalletId,
-			"kyc_status":  user.KycStatus,
-			"updated_at":  user.UpdatedAt,
+			"user_name":  user.UserName,
+			"wallet_id":  user.WalletId,
+			"updated_at": user.UpdatedAt,
 		},
 	}
 
 	result, err := r.collection.UpdateOne(ctx, filter, update)
 	if err != nil {
 		if mongoDriver.IsDuplicateKeyError(err) {
-			return repository.ErrUserAlreadyExists
+			return repository.ErrWalletIdAlreadyExists
 		}
 		return err
 	}

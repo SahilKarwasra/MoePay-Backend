@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/sahilkarwasra/moepay/internal/config"
@@ -35,14 +36,14 @@ func main() {
 	tokenCollection := db.Collection(config.TokenCollection)
 
 	userRepo := mongo.NewUserMongoRepository(userCollection)
+	if err := userRepo.EnsureIndexes(context.Background()); err != nil {
+		log.Printf("failed to ensure user database indexes: %v", err)
+	}
+
 	otpRepo := mongo.NewOtpMongoRepository(otpCollection)
 	tokenRepo := mongo.NewTokenMongoRepository(tokenCollection)
 
 	userService := service.NewUserService(userRepo, otpRepo, tokenRepo)
-
-	routes.SetupRouter(userService)
-
-	log.Println("..--..")
 
 	router := routes.SetupRouter(userService)
 

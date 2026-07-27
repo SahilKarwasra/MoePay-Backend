@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/sahilkarwasra/moepay/internal/models"
@@ -113,9 +114,6 @@ func (s *UserService) VerifyOtpRequest(ctx context.Context, phoneNumber string, 
 			CreatedAt:   time.Now(),
 			UpdatedAt:   time.Now(),
 			UserName:    "",
-			FirstName:   "",
-			LastName:    "",
-			ProfilePic:  "",
 			WalletId:    "",
 			KycStatus:   "",
 		}
@@ -155,5 +153,59 @@ func (s *UserService) VerifyOtpRequest(ctx context.Context, phoneNumber string, 
 		RefreshToken: tokenPair.RefreshToken,
 		IsUserNew:    isUserNew,
 	}, nil
-
 }
+
+func (s *UserService) UpdateUser(
+	ctx context.Context,
+	userID string,
+	req models.UpdateUserRequest,
+) (*models.User, error) {
+	// 1. Validate User ID
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, repository.ErrInvalidUserID
+	}
+
+	// 2. Validate input fields
+	userName := strings.TrimSpace(req.UserName)
+	walletID := strings.TrimSpace(req.WalletId)
+
+	if len(userName) < 3 || len(userName) > 30 {
+		return nil, repository.ErrInvalidUserName
+	}
+
+	if len(walletID) < 3 || len(walletID) > 50 {
+		return nil, repository.ErrInvalidWalletID
+	}
+
+	// 3. Check if user exists
+	user, err := s.userRepo.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. Verify wallet_id uniqueness in database across users
+	existingUser, err := s.userRepo.GetUserByWalletID(ctx, walletID)
+	if err == nil && existingUser != nil {
+		// If another user already has this wallet_id
+		if existingUser.ID != user.ID {
+			return nil, repository.ErrWalletIdAlreadyExists
+		}
+	} else if err != nil && err != repository.ErrUserNotFound {
+		return nil, err
+	}
+
+	// 5. Apply updates
+	user.UserName = userName
+	user.WalletId = walletID
+	user.UpdatedAt = time.Now()
+
+	// 6. Save in DB
+	err = s.userRepo.UpdateUser(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+
+	return user, nil
+}
+
