@@ -2,55 +2,89 @@ package main
 
 import (
 	"context"
-	"log"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	"github.com/sahilkarwasra/moepay/internal/app"
 	"github.com/sahilkarwasra/moepay/internal/config"
-	"github.com/sahilkarwasra/moepay/internal/database"
-	"github.com/sahilkarwasra/moepay/internal/repository/mongo"
-	"github.com/sahilkarwasra/moepay/internal/routes"
-	"github.com/sahilkarwasra/moepay/internal/service"
+	"github.com/sahilkarwasra/moepay/internal/platform/logging"
+	"github.com/sahilkarwasra/moepay/internal/platform/postgres"
+	"github.com/sahilkarwasra/moepay/internal/platform/redisx"
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
 
+func run() error {
 	cfg, err := config.Load()
-
 	if err != nil {
-		log.Fatal("failed to load config", err)
+		return err
+	}
+	logger := logging.New(string(cfg.Env), cfg.LogLevel)
+	slog.SetDefault(logger)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	startCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	pool, err := postgres.Connect(startCtx, cfg.Postgres)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	rdb, err := redisx.Connect(startCtx, cfg.Redis)
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+
+	a, err := app.New(cfg, logger, pool, rdb, app.Options{})
+	if err != nil {
+		return err
 	}
 
-	client, db, err := database.Connect(cfg)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+	a.RunBackground(bgCtx)
 
-	if err != nil {
-		log.Fatal("failed to connect to database", err)
+	srv := &http.Server{
+		Addr:              cfg.HTTP.Addr,
+		Handler:           a.Engine,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       cfg.HTTP.ReadTimeout,
+		WriteTimeout:      cfg.HTTP.WriteTimeout,
+		IdleTimeout:       cfg.HTTP.IdleTimeout,
 	}
-
-	defer func() {
-		if err := database.Disconnect(client); err != nil {
-			log.Printf("failed to disconnect from database %v", err)
-		}
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("server listening", "addr", cfg.HTTP.Addr, "env", cfg.Env)
+		errCh <- srv.ListenAndServe()
 	}()
 
-	userCollection := db.Collection(config.UsersCollections)
-	otpCollection := db.Collection(config.OtpCollections)
-	tokenCollection := db.Collection(config.TokenCollection)
-
-	userRepo := mongo.NewUserMongoRepository(userCollection)
-	if err := userRepo.EnsureIndexes(context.Background()); err != nil {
-		log.Printf("failed to ensure user database indexes: %v", err)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+	case <-ctx.Done():
+		logger.Info("shutting down")
 	}
 
-	otpRepo := mongo.NewOtpMongoRepository(otpCollection)
-	tokenRepo := mongo.NewTokenMongoRepository(tokenCollection)
-
-	userService := service.NewUserService(userRepo, otpRepo, tokenRepo)
-
-	router := routes.SetupRouter(userService)
-
-	port := cfg.ServerPort
-
-	log.Printf("Server starting on port %s", port)
-	if err := router.Run(":" + port); err != nil {
-		log.Fatal("failed to start server: ", err)
-	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
+	defer cancelShutdown()
+	a.Hub.CloseAll()
+	err = srv.Shutdown(shutdownCtx)
+	bgCancel()
+	return err
 }
