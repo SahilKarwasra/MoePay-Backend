@@ -1,2 +1,5 @@
 .env
 tmp/
+bin/
+.idea/
+.DS_Store
