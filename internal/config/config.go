@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // embed zone data so WALLET_TIMEZONE works on any host
 
 	"github.com/joho/godotenv"
 )
@@ -28,6 +29,7 @@ type Config struct {
 	Auth     AuthConfig
 	Username UsernameConfig
 	WS       WSConfig
+	Wallet   WalletConfig
 }
 
 type HTTPConfig struct {
@@ -86,6 +88,21 @@ type WSConfig struct {
 	MaxMessageBytes    int64
 	PingInterval       time.Duration
 	SendBufferMessages int
+}
+
+// WalletConfig holds money limits. All amounts are in pence (GBP).
+type WalletConfig struct {
+	MaxBalancePence    int64
+	MinPerTxnPence     int64
+	MaxPerTxnPence     int64
+	DailyOutgoingPence int64
+	// Location defines the calendar day used for daily limits.
+	Location          *time.Location
+	MaxBankAccounts   int
+	PINMaxAttempts    int
+	PINLockDuration   time.Duration
+	MoneyRequestTTL   time.Duration
+	AccountHashSecret []byte
 }
 
 const minSecretBytes = 32
@@ -157,6 +174,18 @@ func FromEnv(getenv func(string) string) (Config, error) {
 			PingInterval:       p.duration("WS_PING_INTERVAL", 30*time.Second),
 			SendBufferMessages: p.int("WS_SEND_BUFFER", 32),
 		},
+		Wallet: WalletConfig{
+			MaxBalancePence:    int64(p.int("WALLET_MAX_BALANCE_PENCE", 1_000_000)),
+			MinPerTxnPence:     int64(p.int("WALLET_MIN_PER_TXN_PENCE", 1)),
+			MaxPerTxnPence:     int64(p.int("WALLET_MAX_PER_TXN_PENCE", 500_000)),
+			DailyOutgoingPence: int64(p.int("WALLET_DAILY_OUTGOING_PENCE", 1_000_000)),
+			Location:           p.location("WALLET_TIMEZONE", "Europe/London"),
+			MaxBankAccounts:    p.int("WALLET_MAX_BANK_ACCOUNTS", 5),
+			PINMaxAttempts:     p.int("WALLET_PIN_MAX_ATTEMPTS", 5),
+			PINLockDuration:    p.duration("WALLET_PIN_LOCK_DURATION", 30*time.Minute),
+			MoneyRequestTTL:    p.duration("MONEY_REQUEST_TTL", 7*24*time.Hour),
+			AccountHashSecret:  []byte(p.str("ACCOUNT_HASH_SECRET", "")),
+		},
 	}
 
 	// Well-known insecure defaults let `go run` work out of the box outside
@@ -167,6 +196,9 @@ func FromEnv(getenv func(string) string) (Config, error) {
 		}
 		if len(cfg.Auth.OTPSecret) == 0 {
 			cfg.Auth.OTPSecret = []byte("dev-only-otp-secret-change-me-0123456789")
+		}
+		if len(cfg.Wallet.AccountHashSecret) == 0 {
+			cfg.Wallet.AccountHashSecret = []byte("dev-only-account-hash-secret-0123456789")
 		}
 	}
 
@@ -189,8 +221,19 @@ func (c Config) Validate() error {
 	if len(c.Auth.OTPSecret) < minSecretBytes {
 		errs = append(errs, fmt.Errorf("OTP_SECRET must be at least %d bytes", minSecretBytes))
 	}
+	if len(c.Wallet.AccountHashSecret) < minSecretBytes {
+		errs = append(errs, fmt.Errorf("ACCOUNT_HASH_SECRET must be at least %d bytes", minSecretBytes))
+	}
+	w := c.Wallet
+	if w.MinPerTxnPence < 1 || w.MaxPerTxnPence < w.MinPerTxnPence || w.DailyOutgoingPence < w.MaxPerTxnPence || w.MaxBalancePence < w.MaxPerTxnPence {
+		errs = append(errs, errors.New("wallet limits must satisfy 1 <= MIN_PER_TXN <= MAX_PER_TXN <= DAILY_OUTGOING and MAX_PER_TXN <= MAX_BALANCE"))
+	}
+	if w.PINMaxAttempts < 1 || w.MaxBankAccounts < 1 || w.MoneyRequestTTL <= 0 {
+		errs = append(errs, errors.New("WALLET_PIN_MAX_ATTEMPTS, WALLET_MAX_BANK_ACCOUNTS and MONEY_REQUEST_TTL must be positive"))
+	}
 	if c.Env == EnvProduction {
-		if strings.HasPrefix(string(c.Auth.JWTSecret), "dev-only") || strings.HasPrefix(string(c.Auth.OTPSecret), "dev-only") {
+		if strings.HasPrefix(string(c.Auth.JWTSecret), "dev-only") || strings.HasPrefix(string(c.Auth.OTPSecret), "dev-only") ||
+			strings.HasPrefix(string(c.Wallet.AccountHashSecret), "dev-only") {
 			errs = append(errs, errors.New("development secrets must not be used in production"))
 		}
 		if c.Auth.SMSProvider == "log" {
@@ -263,6 +306,16 @@ func (p *parser) float(key string, def float64) float64 {
 		return def
 	}
 	return f
+}
+
+func (p *parser) location(key, def string) *time.Location {
+	name := p.str(key, def)
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		p.err = errors.Join(p.err, fmt.Errorf("%s: unknown time zone %q", key, name))
+		return time.UTC
+	}
+	return loc
 }
 
 func (p *parser) duration(key string, def time.Duration) time.Duration {
