@@ -159,3 +159,27 @@ func (r *Repository) EachUsername(ctx context.Context, q postgres.DBTX, batch in
 		after = names[len(names)-1]
 	}
 }
+
+// FindByUsername looks up a user by normalized username.
+func (r *Repository) FindByUsername(ctx context.Context, q postgres.DBTX, normalized string) (User, error) {
+	u, err := scanUser(q.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE username_normalized = $1`, normalized))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, apperr.ErrNotFound
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("find user by username: %w", err)
+	}
+	return u, nil
+}
+
+// FindByPhone looks up a user by E.164 phone number.
+func (r *Repository) FindByPhone(ctx context.Context, q postgres.DBTX, phoneE164 string) (User, error) {
+	u, err := scanUser(q.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE phone_e164 = $1`, phoneE164))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return User{}, apperr.ErrNotFound
+	}
+	if err != nil {
+		return User{}, fmt.Errorf("find user by phone: %w", err)
+	}
+	return u, nil
+}
