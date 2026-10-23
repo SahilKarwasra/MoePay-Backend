@@ -36,23 +36,25 @@ type Repository struct{}
 
 func NewRepository() *Repository { return &Repository{} }
 
-func (r *Repository) CreateChallenge(ctx context.Context, q postgres.DBTX, phone string, hash []byte, maxAttempts int, ttl time.Duration, ip *netip.Addr) error {
+func (r *Repository) CreateChallenge(ctx context.Context, q postgres.DBTX, phone, purpose string, hash []byte, maxAttempts int, ttl time.Duration, ip *netip.Addr) error {
 	_, err := q.Exec(ctx, `
-		INSERT INTO otp_challenges (phone_e164, code_hash, max_attempts, expires_at, request_ip)
-		VALUES ($1, $2, $3, now() + make_interval(secs => $4), $5)`,
-		phone, hash, maxAttempts, ttl.Seconds(), ip)
+		INSERT INTO otp_challenges (phone_e164, purpose, code_hash, max_attempts, expires_at, request_ip)
+		VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5), $6)`,
+		phone, purpose, hash, maxAttempts, ttl.Seconds(), ip)
 	if err != nil {
 		return fmt.Errorf("create otp challenge: %w", err)
 	}
 	return nil
 }
 
-// RecentChallengeStats returns when the latest challenge for phone was created and how
-// many were created in the last hour. Used as a Redis-independent abuse guard.
-func (r *Repository) RecentChallengeStats(ctx context.Context, q postgres.DBTX, phone string) (last *time.Time, lastHour int, err error) {
+// RecentChallengeStats returns when the latest challenge for phone and purpose was
+// created and how many were created in the last hour. Used as a Redis-independent
+// abuse guard.
+func (r *Repository) RecentChallengeStats(ctx context.Context, q postgres.DBTX, phone, purpose string) (last *time.Time, lastHour int, err error) {
 	err = q.QueryRow(ctx, `
-		SELECT max(created_at), count(*) FILTER (WHERE created_at > now() - interval '1 hour')
-		FROM otp_challenges WHERE phone_e164 = $1 AND created_at > now() - interval '1 hour'`, phone).
+		SELECT max(created_at), count(*)
+		FROM otp_challenges
+		WHERE phone_e164 = $1 AND purpose = $2 AND created_at > now() - interval '1 hour'`, phone, purpose).
 		Scan(&last, &lastHour)
 	if err != nil {
 		return nil, 0, fmt.Errorf("otp stats: %w", err)
@@ -60,15 +62,15 @@ func (r *Repository) RecentChallengeStats(ctx context.Context, q postgres.DBTX, 
 	return last, lastHour, nil
 }
 
-// LockLatestChallenge locks the most recent challenge for phone (FOR UPDATE) so that
-// concurrent verifications are serialized.
-func (r *Repository) LockLatestChallenge(ctx context.Context, tx pgx.Tx, phone string) (*Challenge, error) {
+// LockLatestChallenge locks the most recent challenge for phone and purpose (FOR UPDATE)
+// so that concurrent verifications are serialized.
+func (r *Repository) LockLatestChallenge(ctx context.Context, tx pgx.Tx, phone, purpose string) (*Challenge, error) {
 	var c Challenge
 	err := tx.QueryRow(ctx, `
 		SELECT id, phone_e164, code_hash, attempts, max_attempts, expires_at, consumed_at, created_at
-		FROM otp_challenges WHERE phone_e164 = $1
+		FROM otp_challenges WHERE phone_e164 = $1 AND purpose = $2
 		ORDER BY created_at DESC LIMIT 1
-		FOR UPDATE`, phone).
+		FOR UPDATE`, phone, purpose).
 		Scan(&c.ID, &c.PhoneE164, &c.CodeHash, &c.Attempts, &c.MaxAttempts, &c.ExpiresAt, &c.ConsumedAt, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil

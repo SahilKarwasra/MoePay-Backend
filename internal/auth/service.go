@@ -82,17 +82,64 @@ type SendOTPResult struct {
 	ResendAfterSeconds int    `json:"resend_after_seconds"`
 }
 
+// OTP purposes. A code issued for one purpose cannot be used for another.
+const (
+	PurposeLogin    = "login"
+	PurposePINReset = "pin_reset"
+)
+
 func (s *Service) SendOTP(ctx context.Context, rawPhone string, meta ClientMeta) (SendOTPResult, error) {
 	phone, err := NormalizePhone(rawPhone, s.cfg.DefaultRegion)
 	if err != nil {
 		return SendOTPResult{}, err
 	}
+	return s.issueChallenge(ctx, phone, PurposeLogin, meta)
+}
 
-	// Redis limits (shared across instances): resend cooldown, per phone, per IP.
-	if err := s.limit(ctx, ratelimit.Rule{Name: "otp_cooldown", Limit: 1, Window: s.cfg.OTPResendCooldown}, phone, apperr.ErrOTPCooldown); err != nil {
+// SendActionOTP sends a code to an authenticated user's own phone to confirm a
+// sensitive action such as resetting the wallet PIN.
+func (s *Service) SendActionOTP(ctx context.Context, userID uuid.UUID, purpose string, meta ClientMeta) (SendOTPResult, error) {
+	u, err := s.users.GetByID(ctx, s.pool, userID)
+	if err != nil {
 		return SendOTPResult{}, err
 	}
-	if err := s.limit(ctx, ratelimit.Rule{Name: "otp_phone", Limit: s.cfg.OTPMaxPerPhoneHour, Window: time.Hour}, phone, apperr.ErrRateLimited); err != nil {
+	res, err := s.issueChallenge(ctx, u.PhoneE164, purpose, meta)
+	res.PhoneNumber = MaskPhone(res.PhoneNumber)
+	return res, err
+}
+
+// VerifyActionOTP checks and consumes a code issued by SendActionOTP.
+func (s *Service) VerifyActionOTP(ctx context.Context, userID uuid.UUID, purpose, code string) error {
+	if !isDigits(code, s.otp.Length()) {
+		return apperr.ErrOTPInvalid
+	}
+	u, err := s.users.GetByID(ctx, s.pool, userID)
+	if err != nil {
+		return err
+	}
+	if err := s.limit(ctx, ratelimit.Rule{Name: "otp_verify_" + purpose, Limit: s.cfg.VerifyMaxPerPhone, Window: 15 * time.Minute}, u.PhoneE164, apperr.ErrRateLimited); err != nil {
+		return err
+	}
+	var failure error
+	err = postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		failure, err = s.checkChallenge(ctx, tx, u.PhoneE164, purpose, code)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return failure
+}
+
+func (s *Service) issueChallenge(ctx context.Context, phone, purpose string, meta ClientMeta) (SendOTPResult, error) {
+	limitKey := phone + ":" + purpose
+
+	// Redis limits (shared across instances): resend cooldown, per phone, per IP.
+	if err := s.limit(ctx, ratelimit.Rule{Name: "otp_cooldown", Limit: 1, Window: s.cfg.OTPResendCooldown}, limitKey, apperr.ErrOTPCooldown); err != nil {
+		return SendOTPResult{}, err
+	}
+	if err := s.limit(ctx, ratelimit.Rule{Name: "otp_phone", Limit: s.cfg.OTPMaxPerPhoneHour, Window: time.Hour}, limitKey, apperr.ErrRateLimited); err != nil {
 		return SendOTPResult{}, err
 	}
 	if err := s.limit(ctx, ratelimit.Rule{Name: "otp_ip", Limit: s.cfg.OTPMaxPerIPHour, Window: time.Hour}, meta.ipKey(), apperr.ErrRateLimited); err != nil {
@@ -100,7 +147,7 @@ func (s *Service) SendOTP(ctx context.Context, rawPhone string, meta ClientMeta)
 	}
 
 	// Database guard, independent of Redis availability.
-	last, lastHour, err := s.repo.RecentChallengeStats(ctx, s.pool, phone)
+	last, lastHour, err := s.repo.RecentChallengeStats(ctx, s.pool, phone, purpose)
 	if err != nil {
 		return SendOTPResult{}, err
 	}
@@ -117,19 +164,43 @@ func (s *Service) SendOTP(ctx context.Context, rawPhone string, meta ClientMeta)
 	if err != nil {
 		return SendOTPResult{}, apperr.ErrUnavailable.Wrap(err)
 	}
-	if err := s.repo.CreateChallenge(ctx, s.pool, phone, s.otp.Hash(phone, code), s.cfg.OTPMaxAttempts, s.cfg.OTPTTL, meta.IP); err != nil {
+	if err := s.repo.CreateChallenge(ctx, s.pool, phone, purpose, s.otp.Hash(phone, code), s.cfg.OTPMaxAttempts, s.cfg.OTPTTL, meta.IP); err != nil {
 		return SendOTPResult{}, err
 	}
 	if err := s.sms.SendOTP(ctx, phone, code); err != nil {
 		s.logger.ErrorContext(ctx, "sms delivery failed", "phone", MaskPhone(phone), "err", err)
 		return SendOTPResult{}, apperr.ErrUnavailable.Wrap(err)
 	}
-	s.logger.InfoContext(ctx, "otp sent", "phone", MaskPhone(phone))
+	s.logger.InfoContext(ctx, "otp sent", "phone", MaskPhone(phone), "purpose", purpose)
 	return SendOTPResult{
 		PhoneNumber:        phone,
 		ExpiresInSeconds:   int(s.cfg.OTPTTL.Seconds()),
 		ResendAfterSeconds: int(s.cfg.OTPResendCooldown.Seconds()),
 	}, nil
+}
+
+// checkChallenge verifies code against the latest challenge for phone and purpose.
+// A wrong code increments the attempt counter; the caller must commit the transaction
+// and then return failure.
+func (s *Service) checkChallenge(ctx context.Context, tx pgx.Tx, phone, purpose, code string) (failure, err error) {
+	ch, err := s.repo.LockLatestChallenge(ctx, tx, phone, purpose)
+	if err != nil {
+		return nil, err
+	}
+	if ch == nil || ch.ConsumedAt != nil || !time.Now().Before(ch.ExpiresAt) {
+		return apperr.ErrOTPExpired, nil
+	}
+	if ch.Attempts >= ch.MaxAttempts {
+		return apperr.ErrOTPExhausted, nil
+	}
+	if !s.otp.Verify(phone, code, ch.CodeHash) {
+		attempts, err := s.repo.IncrementAttempts(ctx, tx, ch.ID)
+		if err != nil {
+			return nil, err
+		}
+		return apperr.ErrOTPInvalid.WithDetails(map[string]any{"attempts_remaining": max(ch.MaxAttempts-attempts, 0)}), nil
+	}
+	return nil, s.repo.ConsumeChallenge(ctx, tx, ch.ID)
 }
 
 type TokenPair struct {
@@ -169,27 +240,8 @@ func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string, meta Cli
 		failure error
 	)
 	err = postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		ch, err := s.repo.LockLatestChallenge(ctx, tx, phone)
-		if err != nil {
-			return err
-		}
-		if ch == nil || ch.ConsumedAt != nil || !time.Now().Before(ch.ExpiresAt) {
-			failure = apperr.ErrOTPExpired
-			return nil
-		}
-		if ch.Attempts >= ch.MaxAttempts {
-			failure = apperr.ErrOTPExhausted
-			return nil
-		}
-		if !s.otp.Verify(phone, code, ch.CodeHash) {
-			attempts, err := s.repo.IncrementAttempts(ctx, tx, ch.ID)
-			if err != nil {
-				return err
-			}
-			failure = apperr.ErrOTPInvalid.WithDetails(map[string]any{"attempts_remaining": max(ch.MaxAttempts-attempts, 0)})
-			return nil
-		}
-		if err := s.repo.ConsumeChallenge(ctx, tx, ch.ID); err != nil {
+		var err error
+		if failure, err = s.checkChallenge(ctx, tx, phone, PurposeLogin, code); err != nil || failure != nil {
 			return err
 		}
 
