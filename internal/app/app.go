@@ -12,13 +12,21 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/sahilkarwasra/moepay/internal/auth"
+	"github.com/sahilkarwasra/moepay/internal/bank"
 	"github.com/sahilkarwasra/moepay/internal/config"
+	"github.com/sahilkarwasra/moepay/internal/dashboard"
+	"github.com/sahilkarwasra/moepay/internal/history"
+	"github.com/sahilkarwasra/moepay/internal/idempotency"
+	"github.com/sahilkarwasra/moepay/internal/ledger"
+	"github.com/sahilkarwasra/moepay/internal/moneyrequest"
 	"github.com/sahilkarwasra/moepay/internal/onboarding"
+	"github.com/sahilkarwasra/moepay/internal/payment"
 	"github.com/sahilkarwasra/moepay/internal/platform/httpx"
 	"github.com/sahilkarwasra/moepay/internal/ratelimit"
 	"github.com/sahilkarwasra/moepay/internal/realtime"
 	"github.com/sahilkarwasra/moepay/internal/user"
 	"github.com/sahilkarwasra/moepay/internal/username"
+	"github.com/sahilkarwasra/moepay/internal/wallet"
 )
 
 type App struct {
@@ -31,11 +39,13 @@ type App struct {
 	Usernames *username.Checker
 	Auth      *auth.Service
 	authRepo  *auth.Repository
+	requests  *moneyrequest.Service
 }
 
 // Options overrides dependencies, e.g. tests capture OTPs with a fake SMSSender.
 type Options struct {
-	SMS auth.SMSSender
+	SMS         auth.SMSSender
+	BankGateway bank.Gateway
 }
 
 func New(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.Client, opts Options) (*App, error) {
@@ -76,6 +86,24 @@ func New(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.
 		Logger:     logger,
 	})
 
+	// E-wallet. The ledger is the only writer of balances; wallets open when
+	// onboarding completes, in the same transaction.
+	books := ledger.New(cfg.Wallet)
+	walletSvc := wallet.NewService(pool, wallet.NewRepository(), users, authSvc, cfg.Wallet)
+	onboardingSvc.OnComplete(walletSvc.OnOnboardingCompleted)
+	bankRepo := bank.NewRepository()
+	bankSvc := bank.NewService(pool, bankRepo, walletSvc, cfg.Wallet)
+	gateway := opts.BankGateway
+	if gateway == nil {
+		gateway = bank.DummyGateway{}
+	}
+	historyReader := history.NewReader()
+	paymentSvc := payment.NewService(payment.Deps{
+		Pool: pool, Ledger: books, Wallets: walletSvc, Banks: bankRepo, Gateway: gateway, Users: users,
+		History: historyReader, Events: hub, DefaultRegion: cfg.Auth.DefaultRegion, Logger: logger,
+	})
+	requestSvc := moneyrequest.NewService(pool, moneyrequest.NewRepository(), books, walletSvc, paymentSvc, historyReader, hub, cfg.Wallet)
+
 	if cfg.Env != config.EnvDevelopment {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -94,7 +122,8 @@ func New(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.
 	engine.NoRoute(func(c *gin.Context) { httpx.Fail(c, notFound) })
 	engine.NoMethod(func(c *gin.Context) { httpx.Fail(c, methodNotAllowed) })
 
-	a := &App{Config: cfg, Logger: logger, Pool: pool, Redis: rdb, Engine: engine, Hub: hub, Usernames: names, Auth: authSvc, authRepo: authRepo}
+	a := &App{Config: cfg, Logger: logger, Pool: pool, Redis: rdb, Engine: engine, Hub: hub, Usernames: names,
+		Auth: authSvc, authRepo: authRepo, requests: requestSvc}
 
 	engine.GET("/healthz", func(c *gin.Context) { httpx.OK(c, http.StatusOK, "ok", nil) })
 	engine.GET("/readyz", a.ready)
@@ -107,6 +136,16 @@ func New(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.
 	user.NewHandler(pool, users).Register(authed)
 	onboarding.NewHandler(onboardingSvc, names, limiter).Register(authed)
 	realtime.NewHandler(hub, authSvc, auth.BearerToken, rdb, cfg.WS, logger).Register(public, authed)
+
+	wallet.NewHandler(walletSvc, limiter).Register(authed)
+	bank.NewHandler(bankSvc).Register(authed)
+	payment.NewHandler(paymentSvc, limiter).Register(authed)
+	moneyrequest.NewHandler(requestSvc, limiter).Register(authed)
+	history.NewHandler(pool, historyReader, walletSvc, cfg.Wallet.Location).Register(authed)
+	dashboard.NewHandler(dashboard.Deps{
+		Pool: pool, Users: users, Wallets: walletSvc, Banks: bankRepo, Ledger: books,
+		History: historyReader, Payments: paymentSvc, Requests: requestSvc,
+	}).Register(authed)
 
 	return a, nil
 }
@@ -135,6 +174,25 @@ func (a *App) RunBackground(ctx context.Context) {
 	go a.Hub.Run(ctx)
 	go a.Usernames.Run(ctx, a.Config.Username.BloomRebuildEvery)
 	go a.purgeLoop(ctx)
+	go a.expireRequestsLoop(ctx)
+}
+
+func (a *App) expireRequestsLoop(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n, err := a.requests.ExpireDue(ctx)
+			if err != nil {
+				a.Logger.Error("expire money requests failed", "err", err)
+			} else if n > 0 {
+				a.Logger.Info("expired money requests", "count", n)
+			}
+		}
+	}
 }
 
 func (a *App) purgeLoop(ctx context.Context) {
@@ -150,7 +208,12 @@ func (a *App) purgeLoop(ctx context.Context) {
 				a.Logger.Error("purge expired auth data failed", "err", err)
 				continue
 			}
-			a.Logger.Info("purged expired auth data", "otp_challenges", otps, "sessions", sessions)
+			keys, err := idempotency.Purge(ctx, a.Pool)
+			if err != nil {
+				a.Logger.Error("purge idempotency keys failed", "err", err)
+				continue
+			}
+			a.Logger.Info("purged expired data", "otp_challenges", otps, "sessions", sessions, "idempotency_keys", keys)
 		}
 	}
 }
