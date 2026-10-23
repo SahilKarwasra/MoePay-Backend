@@ -1,6 +1,7 @@
 package user
 
 import (
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -73,4 +74,22 @@ func NewView(u User, p Profile) View {
 		CreatedAt:   u.CreatedAt,
 		UpdatedAt:   u.UpdatedAt,
 	}
+}
+
+// DisplayName is the name shown to other users: full name, else @username.
+func DisplayName(u User, p Profile) string {
+	var parts []string
+	if p.FirstName != nil {
+		parts = append(parts, *p.FirstName)
+	}
+	if p.LastName != nil {
+		parts = append(parts, *p.LastName)
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " ")
+	}
+	if u.Username != nil {
+		return "@" + *u.Username
+	}
+	return "MoePay user"
 }

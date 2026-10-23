@@ -23,7 +23,12 @@ type Publisher interface {
 	PublishToUser(ctx context.Context, userID uuid.UUID, eventType string, data any)
 }
 
+// CompletionHook runs inside the transaction that completes onboarding (e.g. to open
+// the user's wallet), so completion and its side effects commit together.
+type CompletionHook func(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error
+
 type Service struct {
+	hooks  []CompletionHook
 	pool   *pgxpool.Pool
 	repo   *Repository
 	users  *user.Repository
@@ -35,6 +40,9 @@ type Service struct {
 func NewService(pool *pgxpool.Pool, repo *Repository, users *user.Repository, names *username.Checker, events Publisher) *Service {
 	return &Service{pool: pool, repo: repo, users: users, names: names, events: events, now: time.Now}
 }
+
+// OnComplete registers a hook that runs when a user completes onboarding.
+func (s *Service) OnComplete(h CompletionHook) { s.hooks = append(s.hooks, h) }
 
 // Init creates progress for a new user inside the caller's transaction.
 func (s *Service) Init(ctx context.Context, q postgres.DBTX, userID uuid.UUID) error {
@@ -139,6 +147,11 @@ func (s *Service) Complete(ctx context.Context, userID uuid.UUID) (State, error)
 		prog, err = s.repo.Save(ctx, tx, userID, StepCompleted, done, true)
 		if err != nil {
 			return err
+		}
+		for _, h := range s.hooks {
+			if err := h(ctx, tx, userID); err != nil {
+				return err
+			}
 		}
 		state, justCompleted = buildState(u, p, prog), true
 		return nil
