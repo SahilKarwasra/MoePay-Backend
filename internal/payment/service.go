@@ -37,7 +37,25 @@ type Service struct {
 	events  Publisher
 	region  string
 	logger  *slog.Logger
+	hooks   []TransferHook
 }
+
+// TransferEvent describes a P2P transfer that has been posted but not yet committed.
+type TransferEvent struct {
+	TransactionID uuid.UUID
+	FromUserID    uuid.UUID
+	ToUserID      uuid.UUID
+	AmountPence   int64
+	Note          *string
+}
+
+// TransferHook runs inside the transfer's database transaction, so its writes (such
+// as a chat message) commit or roll back together with the money movement. The
+// returned func, if any, runs after the transaction commits.
+type TransferHook func(ctx context.Context, tx pgx.Tx, ev TransferEvent) (func(), error)
+
+// OnTransfer registers a hook for successful P2P transfers.
+func (s *Service) OnTransfer(h TransferHook) { s.hooks = append(s.hooks, h) }
 
 type Deps struct {
 	Pool          *pgxpool.Pool
@@ -104,6 +122,7 @@ func (s *Service) Transfer(ctx context.Context, me uuid.UUID, key string, in Tra
 		return Result{}, false, err
 	}
 
+	var afterCommit []func()
 	fp := transferFingerprint{To: in.To, AmountPence: in.AmountPence, Note: in.Note}
 	res, replayed, err := idempotency.Run(ctx, s.pool, me, key, "POST /transfers", fp, func(tx pgx.Tx) (Result, error) {
 		posted, err := s.ledger.Post(ctx, tx, ledger.Posting{
@@ -113,6 +132,16 @@ func (s *Service) Transfer(ctx context.Context, me uuid.UUID, key string, in Tra
 		if err != nil {
 			return Result{}, err
 		}
+		ev := TransferEvent{TransactionID: posted.TransactionID, FromUserID: me, ToUserID: uuid.MustParse(to.UserID), AmountPence: in.AmountPence, Note: note}
+		for _, h := range s.hooks {
+			after, err := h(ctx, tx, ev)
+			if err != nil {
+				return Result{}, err
+			}
+			if after != nil {
+				afterCommit = append(afterCommit, after)
+			}
+		}
 		return s.result(ctx, tx, from.ID, posted.TransactionID, posted.FromBalance)
 	})
 	if err != nil {
@@ -121,6 +150,9 @@ func (s *Service) Transfer(ctx context.Context, me uuid.UUID, key string, in Tra
 	if !replayed {
 		s.events.PublishToUser(ctx, me, "wallet.debited", res)
 		s.NotifyCounterparty(ctx, uuid.MustParse(to.UserID), to.walletID, res.Transaction.ID, "wallet.credited")
+		for _, f := range afterCommit {
+			f()
+		}
 	}
 	return res, replayed, nil
 }
