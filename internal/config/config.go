@@ -30,6 +30,15 @@ type Config struct {
 	Username UsernameConfig
 	WS       WSConfig
 	Wallet   WalletConfig
+	Chat     ChatConfig
+}
+
+type ChatConfig struct {
+	// EditWindow and DeleteWindow limit how long after sending a message its sender
+	// may edit it or delete it for everyone.
+	EditWindow   time.Duration
+	DeleteWindow time.Duration
+	MaxBodyRunes int
 }
 
 type HTTPConfig struct {
@@ -174,6 +183,11 @@ func FromEnv(getenv func(string) string) (Config, error) {
 			PingInterval:       p.duration("WS_PING_INTERVAL", 30*time.Second),
 			SendBufferMessages: p.int("WS_SEND_BUFFER", 32),
 		},
+		Chat: ChatConfig{
+			EditWindow:   p.duration("CHAT_EDIT_WINDOW", 15*time.Minute),
+			DeleteWindow: p.duration("CHAT_DELETE_WINDOW", 48*time.Hour),
+			MaxBodyRunes: p.int("CHAT_MAX_MESSAGE_LENGTH", 4000),
+		},
 		Wallet: WalletConfig{
 			MaxBalancePence:    int64(p.int("WALLET_MAX_BALANCE_PENCE", 1_000_000)),
 			MinPerTxnPence:     int64(p.int("WALLET_MIN_PER_TXN_PENCE", 1)),
@@ -230,6 +244,9 @@ func (c Config) Validate() error {
 	}
 	if w.PINMaxAttempts < 1 || w.MaxBankAccounts < 1 || w.MoneyRequestTTL <= 0 {
 		errs = append(errs, errors.New("WALLET_PIN_MAX_ATTEMPTS, WALLET_MAX_BANK_ACCOUNTS and MONEY_REQUEST_TTL must be positive"))
+	}
+	if c.Chat.EditWindow <= 0 || c.Chat.DeleteWindow <= 0 || c.Chat.MaxBodyRunes < 1 || c.Chat.MaxBodyRunes > 4000 {
+		errs = append(errs, errors.New("CHAT_EDIT_WINDOW and CHAT_DELETE_WINDOW must be positive; CHAT_MAX_MESSAGE_LENGTH must be 1-4000"))
 	}
 	if c.Env == EnvProduction {
 		if strings.HasPrefix(string(c.Auth.JWTSecret), "dev-only") || strings.HasPrefix(string(c.Auth.OTPSecret), "dev-only") ||

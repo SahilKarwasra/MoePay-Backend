@@ -113,4 +113,11 @@ var (
 	ErrRequestNotPending    = New(http.StatusConflict, "REQUEST_NOT_PENDING", "This money request is no longer pending")
 	ErrTransactionNotFound  = New(http.StatusNotFound, "TRANSACTION_NOT_FOUND", "Transaction not found")
 	ErrMoneyRequestNotFound = New(http.StatusNotFound, "MONEY_REQUEST_NOT_FOUND", "Money request not found")
+
+	ErrConversationNotFound = New(http.StatusNotFound, "CONVERSATION_NOT_FOUND", "Conversation not found")
+	ErrMessageNotFound      = New(http.StatusNotFound, "MESSAGE_NOT_FOUND", "Message not found")
+	ErrMessageInvalid       = New(http.StatusBadRequest, "MESSAGE_INVALID", "Message is not valid")
+	ErrMessageNotEditable   = New(http.StatusConflict, "MESSAGE_NOT_EDITABLE", "This message can no longer be changed")
+	ErrMessageConflict      = New(http.StatusConflict, "MESSAGE_VERSION_CONFLICT", "The message was changed on another device")
+	ErrClientIDReused       = New(http.StatusConflict, "CLIENT_MESSAGE_ID_REUSED", "This client_message_id was already used for a different message")
 )
