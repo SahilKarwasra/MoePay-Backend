@@ -40,6 +40,7 @@ internal/payment     recipient lookup, P2P transfers, add money, withdraw
 internal/moneyrequest request money: create, pay, decline, cancel, expiry
 internal/history     transaction history with keyset pagination and filters
 internal/dashboard   screen aggregates for the home and wallet screens
+internal/chat        1:1 conversations, messages, edits, read receipts, offline sync feed, pay/request in chat
 ```
 
 Handlers parse and render, services own business rules and transactions, repositories are
@@ -60,6 +61,9 @@ stateless and take a `postgres.DBTX` so the caller controls the transaction.
 | `bank_accounts` | linked accounts: sort code, last 4 digits and an HMAC of the full number |
 | `money_requests` | requester, payer, amount, status, expiry, paid transaction |
 | `idempotency_keys` | stored outcome per user and key, kept for 24 hours |
+| `conversations` · `conversation_members` | one conversation per pair of users; per-member read pointer |
+| `messages` · `message_edits` | text, payment and request messages with per-conversation `seq`; previous bodies of edits |
+| `chat_sync_cursors` · `chat_changes` | per-user change feed for offline-first sync |
 
 CHECK constraints mirror the application validation, so bad data cannot get in through any path.
 
@@ -136,7 +140,7 @@ Steps are `profile` → `username` → `review` → `completed`. The next step i
 - **Auth**: native clients send `Authorization: Bearer`. Browsers use a single-use Redis ticket, so tokens never appear in URLs.
 - **Origins**: browser origins must be listed in `WS_ALLOWED_ORIGINS`.
 - **Limits**: read size limit, ping/pong deadlines, max connections per user, bounded send buffer (slow clients are disconnected), and max connection lifetime.
-- **Messages**: client messages are whitelisted (`ping`). The server emits `connected`, `onboarding.updated`, `onboarding.completed`, `wallet.credited`, `wallet.debited`, `money_request.received` and `money_request.updated`.
+- **Messages**: client messages are whitelisted (`ping`, `typing`). The server emits `connected`, `onboarding.updated`, `onboarding.completed`, `wallet.credited`, `wallet.debited`, `money_request.received`, `money_request.updated`, `chat.changes` and `chat.typing`.
 - **Delivery**: events go through Redis pub/sub, so they reach a user's devices on any instance.
 - **Logout** closes the session's sockets with code `4001`.
 
@@ -169,6 +173,51 @@ Steps are `profile` → `username` → `review` → `completed`. The next step i
 - **Money requests**: expire after 7 days (`MONEY_REQUEST_TTL`), and at most 5 can be pending between the same pair of users.
 - **History**: keyset pagination on `(created_at, id)` across both directions of a wallet, with type, status, direction and date filters. Each item has a ready-to-show `title`, `signed_display` and `counterparty`.
 
+## Chat
+
+Chat lives in the same PostgreSQL database as the wallet. A payment sent from chat moves the money and adds the chat message in one transaction: both happen or neither does.
+
+### Endpoints (all Bearer)
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/v1/chat/sync?after=&limit=` | change feed for offline sync (see below) |
+| POST | `/api/v1/conversations` | open (get or create) the chat with `{with: {username \| phone \| user_id}}` |
+| GET | `/api/v1/conversations?cursor=&limit=` | conversations, most recent activity first, with `last_message` and `unread_count` |
+| GET | `/api/v1/conversations/:id` | one conversation |
+| GET | `/api/v1/conversations/:id/messages?before_seq=&limit=` | older messages, newest first |
+| POST | `/api/v1/conversations/:id/messages` | send `{client_message_id, body, reply_to_id?}` |
+| PATCH | `/api/v1/conversations/:id/messages/:messageId` | edit `{body, base_version?}` (own text messages, within `CHAT_EDIT_WINDOW`, default 15 min) |
+| DELETE | `/api/v1/conversations/:id/messages/:messageId` | delete for everyone (own text messages, within `CHAT_DELETE_WINDOW`, default 48 h) |
+| POST | `/api/v1/conversations/:id/read` | `{up_to_seq}`; the peer sees it as a read receipt |
+| POST | `/api/v1/conversations/:id/payments` | pay the other member `{client_message_id, amount_pence, note?, pin}` |
+| POST | `/api/v1/conversations/:id/requests` | request money from the other member `{client_message_id, amount_pence, note?}` |
+
+To pay or decline a request shown in chat, use `POST /money-requests/:id/pay` or `/decline`; the message's `request.actions` says which apply.
+
+### Offline-first sync protocol
+
+1. **Write locally first.** The app writes every outgoing message to its local database with a `client_message_id` (UUID) it generates, then sends it whenever it's online.
+   - Retrying with the same `client_message_id` returns the stored message (`200` with `Idempotent-Replayed: true`), never a duplicate.
+   - For chat payments, `client_message_id` doubles as the `Idempotency-Key` if the header is omitted.
+2. **Pull changes.** The app keeps one number, its sync cursor. It calls `GET /chat/sync?after=<cursor>` and upserts each item by id: `type` `conversation` or `message`, with the same shape as every other endpoint. It stores `next_after` and repeats while `has_more` is true.
+   - Order is guaranteed: changes are numbered per user under a row lock, so once you've seen change N you've also seen every change before it. Nothing committed late can be skipped.
+   - Each entity appears once, at its latest version, so a fresh install syncs from `after=0` and gets current state rather than a replay of history.
+3. **Live updates.** While connected, the WebSocket pushes `chat.changes`, which has the same payload as a sync page.
+   - If `items[0].seq` is your cursor + 1, apply the items and move the cursor.
+   - Otherwise call `/chat/sync`.
+   - Also call it on every reconnect.
+4. **Edits from two devices.** Send `base_version` with an edit. If the message changed meanwhile, the server returns `409 MESSAGE_VERSION_CONFLICT` with the current message.
+5. **Typing indicators** are ephemeral and never stored. The client sends `{"type":"typing","data":{"conversation_id":…,"typing":true}}` on the socket; the peer receives `chat.typing`.
+
+### Messages and money
+
+- **Kinds:** `text`, `payment` (with `payment.amount`, `direction`, `status`, `reference`) and `request` (with `request.amount`, `status`, `direction` and the `actions` the viewer can take).
+- **Everything lands in the chat.** Every P2P payment and money request between two users appears in their conversation, including ones made from the wallet screen. Hooks write the message inside the payment's or request's own transaction.
+- **Request status stays current.** When a request is paid, declined, cancelled or expires, its message is republished to both members' feeds.
+- **Ordering:** each conversation numbers its messages with a contiguous `seq`, assigned under the conversation row lock.
+- **Limits:** messages are 1–4000 characters, with 60 sends per minute per user. Only users who finished onboarding can chat.
+
 ## Open decisions / blockers
 
 - **SMS provider**: only the dev `log` sender exists. Implement `auth.SMSSender` (MSG91, Twilio, …) once a provider and credentials are chosen. Production config refuses `log`.
@@ -176,3 +225,4 @@ Steps are `profile` → `username` → `review` → `completed`. The next step i
 - **Profile edits after onboarding**: no endpoint exists yet.
 - **Phone region**: `PHONE_DEFAULT_REGION` defaults to `IN`. For a UK app, set it to `GB` so local numbers like `07911 123456` parse.
 - **Real bank**: only the instant dummy gateway exists (`bank.Gateway`).
+- **Chat scope**: 1:1 chats only. Not built: group chats, attachments, delivery receipts (sync implies delivery), per-user "delete for me", blocking users and push notifications.
