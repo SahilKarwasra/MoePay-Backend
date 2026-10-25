@@ -257,15 +257,19 @@ func (r *Repository) Counts(ctx context.Context, q postgres.DBTX, viewer uuid.UU
 	return c, nil
 }
 
-// ExpireDue marks overdue pending requests as expired.
-func (r *Repository) ExpireDue(ctx context.Context, q postgres.DBTX) (int64, error) {
-	tag, err := q.Exec(ctx, `
+// ExpireDue marks overdue pending requests as expired and returns them.
+func (r *Repository) ExpireDue(ctx context.Context, q postgres.DBTX) ([]Event, error) {
+	rows, err := q.Query(ctx, `
 		UPDATE money_requests SET status = 'expired', resolved_at = now()
-		WHERE status = 'pending' AND expires_at <= now()`)
+		WHERE status = 'pending' AND expires_at <= now()
+		RETURNING id, requester_user_id, payer_user_id`)
 	if err != nil {
-		return 0, fmt.Errorf("expire money requests: %w", err)
+		return nil, fmt.Errorf("expire money requests: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Event, error) {
+		ev := Event{Status: StatusExpired}
+		return ev, row.Scan(&ev.RequestID, &ev.RequesterID, &ev.PayerID)
+	})
 }
 
 var errBadCursor = apperr.Validation("Invalid cursor", map[string]string{"cursor": "use next_cursor from the previous page"})

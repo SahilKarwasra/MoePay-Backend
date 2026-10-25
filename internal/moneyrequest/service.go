@@ -30,6 +30,47 @@ type Service struct {
 	history  *history.Reader
 	events   payment.Publisher
 	cfg      config.WalletConfig
+	created  []Hook
+	resolved []Hook
+}
+
+// Event identifies a money request whose state changed in the current transaction.
+type Event struct {
+	RequestID   uuid.UUID
+	RequesterID uuid.UUID
+	PayerID     uuid.UUID
+	Status      string
+}
+
+// Hook runs inside the transaction that changed the request. The returned func, if
+// any, runs after the transaction commits.
+type Hook func(ctx context.Context, tx pgx.Tx, ev Event) (func(), error)
+
+// OnCreated and OnResolved register hooks for new requests and for requests that
+// were paid, declined, cancelled or expired.
+func (s *Service) OnCreated(h Hook)  { s.created = append(s.created, h) }
+func (s *Service) OnResolved(h Hook) { s.resolved = append(s.resolved, h) }
+
+// afterCommit collects callbacks to run once the surrounding transaction commits.
+type afterCommit []func()
+
+func (a *afterCommit) run(ctx context.Context, tx pgx.Tx, hooks []Hook, ev Event) error {
+	for _, h := range hooks {
+		f, err := h(ctx, tx, ev)
+		if err != nil {
+			return err
+		}
+		if f != nil {
+			*a = append(*a, f)
+		}
+	}
+	return nil
+}
+
+func (a afterCommit) fire() {
+	for _, f := range a {
+		f()
+	}
 }
 
 func NewService(pool *pgxpool.Pool, repo *Repository, l *ledger.Ledger, wallets *wallet.Service,
@@ -61,7 +102,10 @@ func (s *Service) Create(ctx context.Context, me uuid.UUID, in CreateInput) (Vie
 	}
 	payerID := uuid.MustParse(payer.UserID)
 
-	var view View
+	var (
+		view  View
+		after afterCommit
+	)
 	err = postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		n, err := s.repo.CountPendingBetween(ctx, tx, me, payerID)
 		if err != nil {
@@ -74,6 +118,9 @@ func (s *Service) Create(ctx context.Context, me uuid.UUID, in CreateInput) (Vie
 		if err != nil {
 			return err
 		}
+		if err := after.run(ctx, tx, s.created, Event{RequestID: id, RequesterID: me, PayerID: payerID, Status: StatusPending}); err != nil {
+			return err
+		}
 		view, err = s.repo.Get(ctx, tx, me, id, false)
 		return err
 	})
@@ -81,6 +128,7 @@ func (s *Service) Create(ctx context.Context, me uuid.UUID, in CreateInput) (Vie
 		return View{}, err
 	}
 	s.publishFor(ctx, payerID, view.ID, "money_request.received")
+	after.fire()
 	return view, nil
 }
 
@@ -138,7 +186,10 @@ func (s *Service) Pay(ctx context.Context, me, id uuid.UUID, key string, in PayI
 		return PayResult{}, false, err
 	}
 
-	var requesterWallet wallet.Wallet
+	var (
+		requesterWallet wallet.Wallet
+		after           afterCommit
+	)
 	res, replayed, err := idempotency.Run(ctx, s.pool, me, key, "POST /money-requests/pay", map[string]string{"request_id": id.String()},
 		func(tx pgx.Tx) (PayResult, error) {
 			req, err := s.repo.Get(ctx, tx, me, id, true)
@@ -161,6 +212,9 @@ func (s *Service) Pay(ctx context.Context, me, id uuid.UUID, key string, in PayI
 			if err := s.repo.Resolve(ctx, tx, id, StatusPaid, &posted.TransactionID); err != nil {
 				return PayResult{}, err
 			}
+			if err := after.run(ctx, tx, s.resolved, Event{RequestID: id, RequesterID: req.requesterID, PayerID: me, Status: StatusPaid}); err != nil {
+				return PayResult{}, err
+			}
 			view, err := s.history.Get(ctx, tx, payerWallet.ID, posted.TransactionID)
 			if err != nil {
 				return PayResult{}, err
@@ -178,6 +232,7 @@ func (s *Service) Pay(ctx context.Context, me, id uuid.UUID, key string, in PayI
 		s.events.PublishToUser(ctx, me, "wallet.debited", res.Result)
 		s.payments.NotifyCounterparty(ctx, req.requesterID, requesterWallet.ID, res.Transaction.ID, "wallet.credited")
 		s.publishFor(ctx, req.requesterID, req.ID, "money_request.updated")
+		after.fire()
 	}
 	return res, replayed, nil
 }
@@ -192,7 +247,10 @@ func (s *Service) Cancel(ctx context.Context, me, id uuid.UUID) (View, error) {
 }
 
 func (s *Service) resolve(ctx context.Context, me, id uuid.UUID, direction, status string) (View, error) {
-	var view View
+	var (
+		view  View
+		after afterCommit
+	)
 	err := postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		req, err := s.repo.Get(ctx, tx, me, id, true)
 		if err != nil {
@@ -207,6 +265,9 @@ func (s *Service) resolve(ctx context.Context, me, id uuid.UUID, direction, stat
 		if err := s.repo.Resolve(ctx, tx, id, status, nil); err != nil {
 			return err
 		}
+		if err := after.run(ctx, tx, s.resolved, Event{RequestID: id, RequesterID: req.requesterID, PayerID: req.payerID, Status: status}); err != nil {
+			return err
+		}
 		view, err = s.repo.Get(ctx, tx, me, id, false)
 		return err
 	})
@@ -218,6 +279,7 @@ func (s *Service) resolve(ctx context.Context, me, id uuid.UUID, direction, stat
 		other = view.payerID
 	}
 	s.publishFor(ctx, other, view.ID, "money_request.updated")
+	after.fire()
 	return view, nil
 }
 
@@ -236,5 +298,26 @@ func (s *Service) publishFor(ctx context.Context, userID uuid.UUID, requestID, e
 
 // ExpireDue is run periodically by a background job.
 func (s *Service) ExpireDue(ctx context.Context) (int64, error) {
-	return s.repo.ExpireDue(ctx, s.pool)
+	var (
+		n     int64
+		after afterCommit
+	)
+	err := postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		expired, err := s.repo.ExpireDue(ctx, tx)
+		if err != nil {
+			return err
+		}
+		for _, ev := range expired {
+			if err := after.run(ctx, tx, s.resolved, ev); err != nil {
+				return err
+			}
+		}
+		n = int64(len(expired))
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	after.fire()
+	return n, nil
 }

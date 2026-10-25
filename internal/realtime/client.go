@@ -1,6 +1,7 @@
 package realtime
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -8,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+
+	"github.com/sahilkarwasra/moepay/internal/apperr"
 )
 
 // Application close codes (4000-4999 are reserved for applications).
@@ -119,7 +122,22 @@ func (c *client) route(msg inbound) {
 	case "ping":
 		c.sendEvent("pong", map[string]string{"id": msg.ID})
 	default:
-		c.sendEvent("error", map[string]string{"code": "UNKNOWN_TYPE", "type": msg.Type})
+		fn, ok := c.hub.inbound[msg.Type]
+		if !ok {
+			c.sendEvent("error", map[string]string{"code": "UNKNOWN_TYPE", "type": msg.Type})
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := fn(ctx, c.userID, msg.Data); err != nil {
+			code := "INTERNAL_ERROR"
+			if ae, ok := apperr.As(err); ok {
+				code = ae.Code
+			} else {
+				c.logger.Warn("websocket handler failed", "type", msg.Type, "err", err)
+			}
+			c.sendEvent("error", map[string]string{"code": code, "type": msg.Type, "id": msg.ID})
+		}
 	}
 }
 
