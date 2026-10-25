@@ -3,3 +3,4 @@ tmp/
 bin/
 .idea/
 .DS_Store
+dump.rdb
