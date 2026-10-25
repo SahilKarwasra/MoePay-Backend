@@ -36,6 +36,20 @@ type Hub struct {
 
 	mu    sync.RWMutex
 	users map[uuid.UUID]map[*client]struct{}
+
+	inbound map[string]InboundHandler
+}
+
+// InboundHandler handles a client→server WebSocket message type for an
+// authenticated user. Handlers must be registered before the server starts.
+type InboundHandler func(ctx context.Context, userID uuid.UUID, data json.RawMessage) error
+
+// Handle registers a handler for a client message type.
+func (h *Hub) Handle(msgType string, fn InboundHandler) {
+	if h.inbound == nil {
+		h.inbound = map[string]InboundHandler{}
+	}
+	h.inbound[msgType] = fn
 }
 
 func NewHub(rdb *redis.Client, maxConnsPerUser int, logger *slog.Logger) *Hub {
