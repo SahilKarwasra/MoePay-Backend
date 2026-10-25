@@ -13,6 +13,7 @@ import (
 
 	"github.com/sahilkarwasra/moepay/internal/auth"
 	"github.com/sahilkarwasra/moepay/internal/bank"
+	"github.com/sahilkarwasra/moepay/internal/chat"
 	"github.com/sahilkarwasra/moepay/internal/config"
 	"github.com/sahilkarwasra/moepay/internal/dashboard"
 	"github.com/sahilkarwasra/moepay/internal/history"
@@ -104,6 +105,14 @@ func New(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.
 	})
 	requestSvc := moneyrequest.NewService(pool, moneyrequest.NewRepository(), books, walletSvc, paymentSvc, historyReader, hub, cfg.Wallet)
 
+	// Chat. Registering the service hooks payments and requests into conversations.
+	chatSvc := chat.NewService(chat.Deps{
+		Pool: pool, Repo: chat.NewRepository(), Wallets: walletSvc, Payments: paymentSvc, Requests: requestSvc,
+		Events: hub, Config: cfg.Chat, Logger: logger,
+	})
+	chatHandler := chat.NewHandler(chatSvc, limiter)
+	hub.Handle("typing", chatHandler.HandleTyping)
+
 	if cfg.Env != config.EnvDevelopment {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -142,6 +151,7 @@ func New(cfg config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.
 	payment.NewHandler(paymentSvc, limiter).Register(authed)
 	moneyrequest.NewHandler(requestSvc, limiter).Register(authed)
 	history.NewHandler(pool, historyReader, walletSvc, cfg.Wallet.Location).Register(authed)
+	chatHandler.Register(authed)
 	dashboard.NewHandler(dashboard.Deps{
 		Pool: pool, Users: users, Wallets: walletSvc, Banks: bankRepo, Ledger: books,
 		History: historyReader, Payments: paymentSvc, Requests: requestSvc,
